@@ -1,14 +1,16 @@
 const express = require("express");
-const { Pool } = require("pg");
+const pool = require("./db");
 const fs = require("fs");
 const auth = require("./auth");
+const {
+    isValidUPI,
+    luhnCheck,
+    getCardNetwork,
+    isExpired,
+} = require("./validate");
 
 const app = express();
 app.use(express.json());
-
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL
-});
 
 async function initDB() {
     const schema = fs.readFileSync("./src/schema.sql").toString();
@@ -110,6 +112,106 @@ app.get("/api/v1/orders/:id", auth, async (req, res) => {
         });
     }
 
+    res.json(result.rows[0]);
+});
+
+
+// Create Payment Endpoint
+app.post("/api/v1/payments", auth, async (req, res) => {
+    const { order_id, method, vpa, card_number, exp_month, exp_year, cvv } = req.body;
+
+    // Validate order exists
+    const orderRes = await pool.query(
+        "SELECT * FROM orders WHERE id=$1 AND merchant_id=$2",
+        [order_id, req.merchant.id]
+    );
+    if (orderRes.rows.length === 0) {
+        return res.status(404).json({
+            error: { code: "ORDER_NOT_FOUND", description: "Order not found" },
+        });
+    }
+
+    const amount = orderRes.rows[0].amount;
+
+    // UPI Payment
+    if (method === "UPI") {
+        if (!vpa || !isValidUPI(vpa)) {
+            return res.status(400).json({
+                error: { code: "INVALID_UPI", description: "Invalid UPI VPA" },
+            });
+        }
+    }
+
+    // Card Payment
+    if (method === "CARD") {
+        if (!card_number || !luhnCheck(card_number)) {
+            return res.status(400).json({
+                error: { code: "INVALID_CARD", description: "Card failed Luhn check" },
+            });
+        }
+        if (isExpired(exp_month, exp_year)) {
+            return res.status(400).json({
+                error: { code: "CARD_EXPIRED", description: "Card expired" },
+            });
+        }
+    }
+
+    const paymentId = `pay_${Math.random().toString(36).substr(2, 14)}`;
+
+    // Insert payment with processing status
+    await pool.query(
+        `INSERT INTO payments (id, order_id, merchant_id, amount, currency, method, status, vpa, card_network, card_last4)
+         VALUES ($1,$2,$3,$4,'INR',$5,'processing',$6,$7,$8)`,
+        [
+            paymentId,
+            order_id,
+            req.merchant.id,
+            amount,
+            method,
+            method === "UPI" ? vpa : null,
+            method === "CARD" ? getCardNetwork(card_number) : null,
+            method === "CARD" ? card_number.slice(-4) : null,
+        ]
+    );
+
+    res.status(201).json({
+        id: paymentId,
+        status: "processing",
+        amount,
+        method,
+    });
+
+    // Simulate bank delay + result
+    const delay = process.env.TEST_PROCESSING_DELAY
+        ? parseInt(process.env.TEST_PROCESSING_DELAY)
+        : Math.floor(Math.random() * 5000) + 5000;
+
+    setTimeout(async () => {
+        const success =
+            process.env.TEST_PAYMENT_SUCCESS === "true"
+                ? true
+                : Math.random() < 0.7;
+
+        const status = success ? "success" : "failed";
+
+        await pool.query(
+            "UPDATE payments SET status=$1, updated_at=NOW() WHERE id=$2",
+            [status, paymentId]
+        );
+    }, delay);
+});
+
+// Get Payment Status
+app.get("/api/v1/payments/:id", auth, async (req, res) => {
+    const result = await pool.query(
+        "SELECT * FROM payments WHERE id=$1 AND merchant_id=$2",
+        [req.params.id, req.merchant.id]
+    );
+    if (result.rows.length === 0) {
+        return res.status(404).json({
+            error: { code: "PAYMENT_NOT_FOUND", description: "Payment not found" },
+        });
+    }
     res.json(result.rows[0]);
 });
 
